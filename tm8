@@ -9,11 +9,9 @@ use std::arch::asm;
 // STRUCTS - Cache-line aligned, padded for prefetch friendliness
 // ============================================================================
 
-/// 2048-bit integer as 8 × 256-bit limbs
-/// Each limb is 4 × u64, stored little-endian
+/// int2048 as 8(256) limbs 4(u64), stored little-endian
 /// 
-/// Memory layout deliberately spans exactly 4 cache lines (256 bytes)
-/// to enable clean prefetch patterns
+/// Memory span spans precisely 4 cache lines
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct Int2048 {
@@ -27,31 +25,23 @@ pub struct Int4096 {
     pub limbs: [[u64; 4]; 16], // 512 bytes
 }
 
-/// Workspace for intermediate values during Toom-8
-/// Sized to hold evaluation results with overflow headroom
-/// 
-/// Layout designed for sequential access patterns:
-/// - eval_a[0..15]: 15 evaluated points for operand A (each ~320 bits worst case)
-/// - eval_b[0..15]: 15 evaluated points for operand B
-/// - products[0..15]: 15 pointwise products (each ~640 bits)
-/// - interp[0..15]: interpolation intermediates
+/// Workspace for intermediates during eval w overflow
 #[repr(C, align(64))]
 pub struct Toom8Workspace {
-    // Each evaluation can overflow to ~320 bits due to coefficient magnitudes
+    // may overflow to ~320 bits due to coefficient scalarity
     // Store as 6 × u64 (384 bits) to be safe, padded to 64 bytes for alignment
     pub eval_a: [[u64; 8]; 15],     // 15 × 64 = 960 bytes
     pub eval_b: [[u64; 8]; 15],     // 960 bytes
-    // Products are ~640 bits, store as 12 × u64, padded to 128 bytes
     pub products: [[u64; 16]; 15],  // 15 × 128 = 1920 bytes
-    // Interpolation scratch - same size as products
+    // Interpolation scratch
     pub interp: [[u64; 16]; 15],    // 1920 bytes
-    // Carry propagation scratch
+    // Carry propagation
     pub carries: [[u64; 4]; 32],    // 1024 bytes
 }
 
 impl Toom8Workspace {
     pub fn new() -> Box<Self> {
-        // Use Box to get heap allocation with alignment
+        // heap allocation with alignment
         unsafe {
             let layout = std::alloc::Layout::new::<Self>();
             let ptr = std::alloc::alloc_zeroed(layout) as *mut Self;
@@ -111,34 +101,27 @@ pub const EVAL_COEFFS: [[i64; 8]; 15] = [
 // Pre Xeon 6 considerations:
 // 1. 512-bit operations can cause frequency throttling (varies by SKU/config)
 // 2. Some configs execute zmm as 2×ymm on ports 0+1 or 0+5
-//
 // Granite Rapids (Xeon 6):
-// 1. True 512-bit datapaths, less throttling concern
-// 2. Still benefits from the half-independence for superscalar dispatch
+// 1. True 512-bit,no throttling
+// 2. benefits from the half-independence for superscalar dispatch
 //
 // Strategy: Treat zmm as "2 ymm stapled together" in the dependency graph.
 // Operations on lanes [0:3] should not depend on lanes [4:7] within same zmm.
-// This gives the schedulers maximum flexibility.
 //
-// Register allocation philosophy:
-// - zmm0-7:   Operand A limbs (persistent during evaluation)
-// - zmm8-15:  Operand B limbs (persistent during evaluation)  
-// - zmm16-23: Accumulator bank (computation)
-// - zmm24-31: Sidecar bank (parallel computation OR spill storage)
+// Register strategy:
+// - zmm0-7:   Operand A perduring eval
+// - zmm8-15:  Operand B perduring eval 
+// - zmm16-23: Accumulators
+// - zmm24-31: Sidecar
 //
-// The sidecar bank switches roles based on phase:
-// - Evaluation: parallel accumulation for second operand
-// - Pointwise:  holds partial products during schoolbook
-// - Interpolation: scratch for matrix application
-//
+// The sidecar shifts between accumulation, intermediate products, and matrix interpolation 
 // ============================================================================
 
 // ============================================================================
 // PHASE 1: LOAD WITH PREFETCH CHOREOGRAPHY
 // ============================================================================
 
-/// Load operands with software prefetch for workspace
-/// Designed to hide memory latency by prefetching workspace while loading inputs
+/// Load operands w soft prefetch
 #[inline(always)]
 pub unsafe fn load_operands_with_prefetch(
     a: *const Int2048,
@@ -146,7 +129,7 @@ pub unsafe fn load_operands_with_prefetch(
     ws: *mut Toom8Workspace,
 ) {
     asm!(
-        // Prefetch workspace cache lines while we load operands
+        // Prefetch workspace cache lines
         // T0 = prefetch to all cache levels (L1/L2/L3)
         "prefetcht0 [{ws}]",
         "prefetcht0 [{ws} + 64]",
@@ -196,32 +179,22 @@ pub unsafe fn load_operands_with_prefetch(
 // PHASE 2: EVALUATION KERNEL
 // ============================================================================
 // 
-// Core insight for speed: the evaluation matrix is sparse and structured.
 // Most entries are powers of 2, so we can use shifts instead of multiplies.
 //
 // For each evaluation point p, compute:
 //   eval_a[p] = a0 + a1*p + a2*p² + ... + a7*p⁷
 //
-// Using Horner's form:
+// Horner's form:
 //   eval_a[p] = a0 + p*(a1 + p*(a2 + p*(a3 + p*(a4 + p*(a5 + p*(a6 + p*a7))))))
 //
-// For power-of-2 points, each multiply-by-p is just a shift.
-// For negative points, we alternate signs.
-//
 // HOWEVER: Horner has a serial dependency chain of depth 7.
-// Alternative: direct summation with parallel shifts, then tree reduction.
+// Alternative direct summation tree reduction.
 // 
 // Direct summation for point 2:
 //   a0 + (a1<<1) + (a2<<2) + (a3<<3) + (a4<<4) + (a5<<5) + (a6<<6) + (a7<<7)
 //
-// This is 7 shifts (parallel) + tree of 7 adds (depth 3).
-// Much better than Horner's depth-7 chain.
-
-/// Evaluate both polynomials at a power-of-2 point
-/// Uses shift-and-add with tree reduction
 /// 
-/// point_log2: log2 of the evaluation point (1 for point=2, 2 for point=4, etc.)
-/// negate_odd: if true, negate odd-indexed terms (for negative points)
+/// if negate_odd = T negate odd-indexed terms for negative points
 #[inline(always)]
 pub unsafe fn eval_power_of_2_point(
     point_log2: u8,
@@ -229,17 +202,17 @@ pub unsafe fn eval_power_of_2_point(
     out_a: *mut [u64; 8],
     out_b: *mut [u64; 8],
 ) {
-    // This would be a giant asm block; showing structure
+    // obvs incomplete 
     if negate_odd {
         asm!(
-            // Load shift amount into a GPR for variable shift
-            // (Could also use immediate if unrolling per-point)
+            
+            // immediate if unrolling per-point
             
             // --- Operand A evaluation ---
             // zmm0-7 contain a0..a7
             // Need: a0 - (a1<<k) + (a2<<2k) - (a3<<3k) + ...
             
-            // Compute all shifts in parallel (independent operations)
+            // Compute all shifts in parallel 
             "vpsllq zmm16, zmm1, {shift}",      // a1 << k
             "vpsllq zmm17, zmm2, {shift2}",     // a2 << 2k  
             "vpsllq zmm18, zmm3, {shift3}",     // a3 << 3k
@@ -248,7 +221,7 @@ pub unsafe fn eval_power_of_2_point(
             "vpsllq zmm21, zmm6, {shift6}",     // a6 << 6k
             "vpsllq zmm22, zmm7, {shift7}",     // a7 << 7k
             
-            // Tree reduction with alternating signs
+            // Tree reduction alternating signature
             // Level 1: 4 parallel operations
             "vpsubq zmm16, zmm0, zmm16",        // a0 - a1<<k
             "vpsubq zmm17, zmm17, zmm18",       // a2<<2k - a3<<3k
@@ -305,7 +278,6 @@ pub unsafe fn eval_power_of_2_point(
             options(nostack, preserves_flags),
         );
     } else {
-        // Similar but with vpaddq throughout
         asm!(
             "vpsllq zmm16, zmm1, {shift}",
             "vpsllq zmm17, zmm2, {shift2}",
@@ -367,7 +339,7 @@ pub unsafe fn eval_power_of_2_point(
     }
 }
 
-/// Special case: evaluate at point 0 (just return limb[0])
+/// Special case: evaluate pt 0 (ret limb[0])
 #[inline(always)]
 pub unsafe fn eval_point_0(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
     asm!(
@@ -379,7 +351,7 @@ pub unsafe fn eval_point_0(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
     );
 }
 
-/// Special case: evaluate at point ∞ (just return limb[7])
+/// Special case: evaluate at point (inf) (ret limb[7])
 #[inline(always)]
 pub unsafe fn eval_point_inf(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
     asm!(
@@ -391,30 +363,24 @@ pub unsafe fn eval_point_inf(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
     );
 }
 
-/// Special case: evaluate at point 1 (sum of all limbs)
+/// Special case: eval at pt 1 (sum limbs)
 #[inline(always)]
 pub unsafe fn eval_point_1(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
     asm!(
-        // Tree reduction for sum
-        // Level 1: 4 pairwise sums
         "vpaddq zmm16, zmm0, zmm1",
         "vpaddq zmm17, zmm2, zmm3",
         "vpaddq zmm18, zmm4, zmm5",
         "vpaddq zmm19, zmm6, zmm7",
-        
-        // B in parallel
         "vpaddq zmm24, zmm8, zmm9",
         "vpaddq zmm25, zmm10, zmm11",
         "vpaddq zmm26, zmm12, zmm13",
         "vpaddq zmm27, zmm14, zmm15",
         
-        // Level 2
         "vpaddq zmm16, zmm16, zmm17",
         "vpaddq zmm17, zmm18, zmm19",
         "vpaddq zmm24, zmm24, zmm25",
         "vpaddq zmm25, zmm26, zmm27",
         
-        // Level 3
         "vpaddq zmm16, zmm16, zmm17",
         "vpaddq zmm24, zmm24, zmm25",
         
@@ -429,14 +395,13 @@ pub unsafe fn eval_point_1(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
     );
 }
 
-/// Special case: evaluate at point -1 (alternating sum)
+/// Special case: evaluate at point -1 (alternating summation)
 #[inline(always)]
 pub unsafe fn eval_point_neg1(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
     asm!(
         // a0 - a1 + a2 - a3 + a4 - a5 + a6 - a7
         // Regroup: (a0 - a1) + (a2 - a3) + (a4 - a5) + (a6 - a7)
         
-        // Level 1: pairwise differences
         "vpsubq zmm16, zmm0, zmm1",
         "vpsubq zmm17, zmm2, zmm3",
         "vpsubq zmm18, zmm4, zmm5",
@@ -447,13 +412,11 @@ pub unsafe fn eval_point_neg1(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
         "vpsubq zmm26, zmm12, zmm13",
         "vpsubq zmm27, zmm14, zmm15",
         
-        // Level 2: sum of differences
         "vpaddq zmm16, zmm16, zmm17",
         "vpaddq zmm17, zmm18, zmm19",
         "vpaddq zmm24, zmm24, zmm25",
         "vpaddq zmm25, zmm26, zmm27",
         
-        // Level 3
         "vpaddq zmm16, zmm16, zmm17",
         "vpaddq zmm24, zmm24, zmm25",
         
@@ -471,15 +434,10 @@ pub unsafe fn eval_point_neg1(out_a: *mut [u64; 8], out_b: *mut [u64; 8]) {
 // ============================================================================
 // PHASE 3: POINTWISE MULTIPLICATION
 // ============================================================================
-//
-// This is the expensive part: 15 multiplications of ~320-bit numbers.
-// Each multiplication produces ~640 bits.
-//
-// Strategy depends on available features:
+// Each mult ~640b
 // - With AVX512-IFMA: 52-bit limbs, use VPMADD52LUQ/VPMADD52HUQ
 // - Without IFMA: decompose 64×64 into 32×32 using VPMULUDQ
 //
-// The IFMA path is ~3× faster but requires runtime detection for portability.
 
 /// Check for IFMA support at runtime
 #[inline(always)]
@@ -496,34 +454,27 @@ pub fn has_ifma() -> bool {
     { false }
 }
 
-/// 256×256 → 512 multiplication using VPMULUDQ decomposition
-/// 
 /// Each 64-bit limb is treated as 2×32-bit for multiplication,
 /// then we reconstruct the full 128-bit partial products.
 ///
-/// Input:  a[0..4], b[0..4] as u64 arrays (representing 256-bit values)
-/// Output: r[0..8] as u64 array (representing 512-bit product)
-/// 
-/// This is the schoolbook 4×4 multiplication at the limb level.
+/// Input:  a[0..4], b[0..4] as u64 arrays
+/// Output: r[0..8] as u64 array
+///
 #[inline(always)]
 pub unsafe fn mul_256x256_muludq(
     a_ptr: *const [u64; 8],  // only first 4 used, rest is padding
     b_ptr: *const [u64; 8],
     r_ptr: *mut [u64; 16],   // only first 8 used
 ) {
-    // The full schoolbook expansion is large; showing key patterns
+    // The full schoolbook is long
     asm!(
-        // Load a and b into registers with broadcast preparation
+        // Load a and b with broadcast preparation
         "vmovdqu64 ymm0, [{a}]",        // a[0..3]
         "vmovdqu64 ymm8, [{b}]",        // b[0..3]
         
-        // For VPMULUDQ, we need to decompose each 64-bit into 32-bit halves
-        // VPMULUDQ multiplies even 32-bit lanes: 
-        //   result[i] = src1[2i] * src2[2i] (zero-extended to 64-bit)
-        
-        // Strategy: 
-        // 1. Create "low" version: mask out high 32 bits of each qword
-        // 2. Create "high" version: shift right by 32
+      
+        // 1. Create low version: mask out high 32b/qword
+        // 2. Create high version: shift right by 32
         // 3. Do 4 VPMULUDQ per pair of limbs, accumulate with proper shifts
         
         // Mask for low 32 bits of each qword
@@ -594,10 +545,10 @@ pub unsafe fn mul_256x256_muludq(
         // etc.
         
         // ... Continue for a1, a2, a3 ...
-        // (This is ~80 more instructions for the full schoolbook)
         
         // Store result
-        "vmovdqu64 [{r}], zmm16",        // Placeholder - real code accumulates properly
+        "vmovdqu64 [{r}], zmm16",        // 
+        // Placeholder
         
         a = in(reg) a_ptr,
         b = in(reg) b_ptr,
@@ -611,9 +562,6 @@ pub unsafe fn mul_256x256_muludq(
     );
 }
 
-/// 256×256 → 512 multiplication using IFMA (when available)
-/// 
-/// Uses 52-bit limbs: 256 bits = 5 limbs (5×52 = 260 > 256)
 /// Product = 10 limbs before normalization
 #[target_feature(enable = "avx512ifma")]
 #[inline(always)]
@@ -622,19 +570,15 @@ pub unsafe fn mul_256x256_ifma(
     b_ptr: *const [u64; 8],
     r_ptr: *mut [u64; 16],
 ) {
-    // IFMA provides:
-    // VPMADD52LUQ: dst += (a * b)[51:0]   (low 52 bits of 104-bit product)
-    // VPMADD52HUQ: dst += (a * b)[103:52] (high 52 bits of 104-bit product)
-    //
-    // For 52-bit limbs, carries fit in the remaining 12 bits of a u64
-    // (up to 4096 additions before overflow).
+    // VPMADD52LUQ: dst += (a * b)[51:0] lo
+    // VPMADD52HUQ: dst += (a * b)[103:52] hi
     
     asm!(
-        // Load 5 limbs of a and b (52-bit packed)
+        // Load 5a 5b
         "vmovdqu64 zmm0, [{a}]",
         "vmovdqu64 zmm8, [{b}]",
         
-        // Initialize accumulators for 10 result limbs
+        // Initialize 10 accumulators
         "vpxorq zmm16, zmm16, zmm16",    // r0
         "vpxorq zmm17, zmm17, zmm17",    // r1
         "vpxorq zmm18, zmm18, zmm18",    // r2
@@ -766,39 +710,27 @@ pub unsafe fn exact_div_by_3_inplace(val: *mut [u64; 16]) {
 // PHASE 5: RECOMPOSITION
 // ============================================================================
 //
-// After interpolation, we have 15 coefficients c[0..14], each ~512 bits.
-// The final result is:
-//   R = Σ c[i] * B^(256*i)  where B = 2^256
-//
-// This is essentially polynomial evaluation at B, with carries.
-// Since we deferred carries, now we propagate them through the result.
-
 /// Propagate carries through the final result
-/// Each coefficient overlaps with its neighbors by 256 bits
 #[inline(always)]
 pub unsafe fn propagate_carries(ws: *mut Toom8Workspace, result: *mut Int4096) {
     // The 15 coefficients c[0..14] each occupy positions:
-    //   c[i] contributes to result limbs [i, i+1]
-    //
-    // We accumulate from low to high, propagating carries.
     
     asm!(
         // Start with c[0] in result[0..1]
         "vmovdqu64 zmm0, [{ws} + {c0_off}]",      // c[0] low 512 bits
-        "vmovdqu64 [{result}], zmm0",              // store to result[0..1]
-        
+        "vmovdqu64 [{result}], zmm0",       
+
         // Add c[1] to result[1..2], propagate carry
         "vmovdqu64 zmm1, [{ws} + {c1_off}]",
         "vmovdqu64 zmm0, [{result} + 64]",         // load result[1]
         "vpaddq zmm0, zmm0, zmm1",                 // result[1] += c[1]_low
         
-        // Check for carry (overflow detection is tricky in SIMD)
-        // Strategy: compare result to one of the addends
+        // Check for carry (overflow detection is cluster)
+        // comp to one of the addenda
         // If result < addend, carry occurred
         "vpcmpuq k1, zmm0, zmm1, 1",               // k1 = (result < c[1]) ? 1 : 0
         
         // ... carry propagation continues ...
-        // This is actually the trickiest part to get right efficiently
         
         ws = in(reg) ws,
         result = in(reg) result,
